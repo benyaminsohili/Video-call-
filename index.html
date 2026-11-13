@@ -1,0 +1,166 @@
+<!DOCTYPE html>
+<html lang="fa" dir="rtl">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>تماس تصویری بدون محدودیت</title>
+  <style>
+    * { box-sizing: border-box; font-family: Tahoma, sans-serif; }
+    body { margin: 0; background: #0f172a; color: #fff; display: flex; flex-direction: column; align-items: center; justify-content: center; min-height: 100vh; padding: 15px; }
+    .controls { margin-bottom: 15px; display: flex; flex-wrap: wrap; gap: 10px; justify-content: center; }
+    input, button { padding: 11px 16px; border-radius: 8px; border: none; font-size: 14px; }
+    input { background: #1e293b; color: #fff; border: 1px solid #334155; }
+    button { background: #3b82f6; color: #fff; cursor: pointer; font-weight: bold; }
+    button:hover { background: #2563eb; }
+    button.danger { background: #ef4444; }
+    .videos { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 15px; width: 100%; max-width: 900px; }
+    video { width: 100%; border-radius: 12px; background: #000; aspect-ratio: 16/9; object-fit: cover; border: 2px solid #334155; }
+    #status { margin-bottom: 12px; color: #94a3b8; font-size: 13px; text-align: center; }
+  </style>
+  <!-- کتابخانه رسمی Supabase -->
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+</head>
+<body>
+
+  <div class="controls" id="joinBox">
+    <input type="text" id="roomInput" placeholder="نام اتاق (مثلا: test)" value="room1">
+    <button onclick="startCall()">ورود به تماس</button>
+  </div>
+
+  <div id="status">نام اتاق را وارد کرده و روی ورود بزنید</div>
+
+  <div class="videos">
+    <video id="localVideo" autoplay playsinline muted></video>
+    <video id="remoteVideo" autoplay playsinline></video>
+  </div>
+
+  <div class="controls" id="callControls" style="display:none; margin-top:15px;">
+    <button onclick="toggleAudio()" id="micBtn">قطع میکروفون</button>
+    <button onclick="toggleVideo()" id="camBtn">قطع دوربین</button>
+    <button class="danger" onclick="location.reload()">قطع تماس</button>
+  </div>
+
+  <script>
+    // 🔴 اطلاعات پروژه Supabase خود را اینجا وارد کنید:
+    const SUPABASE_URL = 'https://YOUR-PROJECT.supabase.co';
+    const SUPABASE_ANON_KEY = 'YOUR-ANON-PUBLIC-KEY';
+
+    const supabaseClient = supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+
+    let localStream;
+    let pc;
+    let channel;
+
+    // سرورهای STUN غیرفیلتر برای عملکرد صحیح در ایران
+    const rtcConfig = {
+      iceServers: [
+        { urls: 'stun:stun.cloudflare.com:3478' },
+        { urls: 'stun:stun.nextcloud.com:443' }
+      ]
+    };
+
+    async function startCall() {
+      const roomName = document.getElementById('roomInput').value.trim();
+      if (!roomName) return alert('نام اتاق را وارد کنید');
+
+      document.getElementById('joinBox').style.display = 'none';
+      document.getElementById('callControls').style.display = 'flex';
+      setStatus('در حال دسترسی به دوربین و میکروفون...');
+
+      try {
+        localStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+        document.getElementById('localVideo').srcObject = localStream;
+      } catch (err) {
+        setStatus('خطا: دسترسی به دوربین یا میکروفون داده نشد!');
+        return;
+      }
+
+      setStatus('در حال اتصال به اتاق: ' + roomName);
+
+      // ساخت کانال ارتباطی بلادرنگ در Supabase
+      channel = supabaseClient.channel('room-' + roomName, {
+        config: { broadcast: { self: false } }
+      });
+
+      channel
+        .on('broadcast', { event: 'signal' }, async ({ payload }) => {
+          if (payload.type === 'ready') {
+            // نفر دوم وارد شد؛ نفر اول پیشنهاد (Offer) می‌سازد
+            setStatus('نفر دوم متصل شد. در حال برقراری تصویر...');
+            createPeerConnection();
+            const offer = await pc.createOffer();
+            await pc.setLocalDescription(offer);
+            sendSignal({ type: 'offer', offer });
+          } 
+          else if (payload.type === 'offer') {
+            setStatus('در حال پاسخ به تماس...');
+            createPeerConnection();
+            await pc.setRemoteDescription(new RTCSessionDescription(payload.offer));
+            const answer = await pc.createAnswer();
+            await pc.setLocalDescription(answer);
+            sendSignal({ type: 'answer', answer });
+          } 
+          else if (payload.type === 'answer') {
+            await pc.setRemoteDescription(new RTCSessionDescription(payload.answer));
+          } 
+          else if (payload.type === 'ice-candidate' && payload.candidate) {
+            try {
+              await pc.addIceCandidate(new RTCIceCandidate(payload.candidate));
+            } catch (e) {}
+          }
+        })
+        .subscribe((status) => {
+          if (status === 'SUBSCRIBED') {
+            setStatus('در انتظار نفر دوم در اتاق: ' + roomName);
+            // اعلام حضور به نفر احتمالی حاضر در اتاق
+            sendSignal({ type: 'ready' });
+          }
+        });
+    }
+
+    function sendSignal(payload) {
+      channel.send({
+        type: 'broadcast',
+        event: 'signal',
+        payload
+      });
+    }
+
+    function createPeerConnection() {
+      if (pc) pc.close();
+      pc = new RTCPeerConnection(rtcConfig);
+
+      localStream.getTracks().forEach(track => {
+        pc.addTrack(track, localStream);
+      });
+
+      pc.ontrack = (event) => {
+        document.getElementById('remoteVideo').srcObject = event.streams[0];
+        setStatus('تماس تصویری فعال است');
+      };
+
+      pc.onicecandidate = (event) => {
+        if (event.candidate) {
+          sendSignal({ type: 'ice-candidate', candidate: event.candidate });
+        }
+      };
+    }
+
+    function toggleAudio() {
+      const track = localStream.getAudioTracks()[0];
+      track.enabled = !track.enabled;
+      document.getElementById('micBtn').innerText = track.enabled ? 'قطع میکروفون' : 'وصل میکروفون';
+    }
+
+    function toggleVideo() {
+      const track = localStream.getVideoTracks()[0];
+      track.enabled = !track.enabled;
+      document.getElementById('camBtn').innerText = track.enabled ? 'قطع دوربین' : 'وصل دوربین';
+    }
+
+    function setStatus(text) {
+      document.getElementById('status').innerText = text;
+    }
+  </script>
+</body>
+</html>
